@@ -18021,6 +18021,148 @@ static void close_var_refs(JSRuntime *rt, JSFunctionBytecode *b, JSStackFrame *s
     }
 }
 
+#define FRAME_CYCLE_MAX 16
+#define FRAME_CYCLE_EDGES 48
+
+/* Free the cycles made only of the variable references closed by a
+   returning frame and the closures they hold. The usual case is a
+   recursive local function: closure -> var_ref -> closure. 'cells'
+   holds one reference to each var_ref. Trial deletion over this small
+   set: a member is live when it has references from outside the set,
+   and so is everything it reaches inside the set. */
+static void free_frame_cycles(JSRuntime *rt, JSVarRef **cells, int n)
+{
+    JSObject *closures[FRAME_CYCLE_MAX];
+    int owner[FRAME_CYCLE_MAX], cell_edges[FRAME_CYCLE_MAX];
+    int closure_edges[FRAME_CYCLE_MAX];
+    BOOL cell_live[FRAME_CYCLE_MAX], closure_live[FRAME_CYCLE_MAX];
+    uint8_t edge_from[FRAME_CYCLE_EDGES], edge_to[FRAME_CYCLE_EDGES];
+    int i, j, k, e, n_closures, n_edges;
+    BOOL any_dead, changed;
+
+    n_closures = 0;
+    for(i = 0; i < n; i++) {
+        JSVarRef *v = cells[i];
+        owner[i] = -1;
+        /* a count of one is our own reference */
+        if (js_rc(v)->ref_count > 1 &&
+            JS_VALUE_GET_TAG(v->value) == JS_TAG_OBJECT) {
+            JSObject *p = JS_VALUE_GET_OBJ(v->value);
+            if (p->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                for(j = 0; j < n_closures; j++) {
+                    if (closures[j] == p)
+                        break;
+                }
+                if (j == n_closures)
+                    closures[n_closures++] = p;
+                owner[i] = j;
+            }
+        }
+    }
+    if (n_closures == 0)
+        goto done;
+    for(j = 0; j < n_closures; j++)
+        closure_edges[j] = 0;
+    for(i = 0; i < n; i++) {
+        if (owner[i] >= 0)
+            closure_edges[owner[i]]++;
+    }
+    /* usual case: every closure escaped */
+    any_dead = FALSE;
+    for(j = 0; j < n_closures; j++) {
+        closure_live[j] = js_rc(closures[j])->ref_count > closure_edges[j];
+        if (!closure_live[j])
+            any_dead = TRUE;
+    }
+    if (!any_dead)
+        goto done;
+    /* edges closure -> var_ref inside the set */
+    for(i = 0; i < n; i++)
+        cell_edges[i] = 0;
+    n_edges = 0;
+    for(j = 0; j < n_closures; j++) {
+        JSObject *p = closures[j];
+        JSFunctionBytecode *b = p->u.func.function_bytecode;
+        JSVarRef **var_refs = p->u.func.var_refs;
+        if (!var_refs)
+            continue;
+        for(k = 0; k < b->closure_var_count; k++) {
+            for(i = 0; i < n; i++) {
+                if (var_refs[k] == cells[i]) {
+                    if (n_edges == FRAME_CYCLE_EDGES)
+                        goto done; /* left to the cycle collector */
+                    cell_edges[i]++;
+                    edge_from[n_edges] = j;
+                    edge_to[n_edges] = i;
+                    n_edges++;
+                    break;
+                }
+            }
+        }
+    }
+    for(i = 0; i < n; i++) {
+        cell_live[i] = owner[i] < 0 ||
+            js_rc(cells[i])->ref_count - 1 > cell_edges[i];
+    }
+    /* propagate liveness along the edges of the set */
+    do {
+        changed = FALSE;
+        for(i = 0; i < n; i++) {
+            if (cell_live[i] && owner[i] >= 0 && !closure_live[owner[i]]) {
+                closure_live[owner[i]] = TRUE;
+                changed = TRUE;
+            }
+        }
+        for(e = 0; e < n_edges; e++) {
+            if (closure_live[edge_from[e]] && !cell_live[edge_to[e]]) {
+                cell_live[edge_to[e]] = TRUE;
+                changed = TRUE;
+            }
+        }
+    } while (changed);
+    /* each dead var_ref drops its closure. The closures and the
+       var_refs are then freed by reference counting. */
+    for(i = 0; i < n; i++) {
+        if (!cell_live[i]) {
+            JSValue val = cells[i]->value;
+            cells[i]->value = JS_UNDEFINED;
+            JS_FreeValueRT(rt, val);
+        }
+    }
+ done:
+    for(i = 0; i < n; i++)
+        free_var_ref(rt, cells[i]);
+}
+
+/* close the variable references of a returning normal frame, free its
+   local variables and stack [local_buf, sp), then free the closure
+   cycles it left behind */
+static no_inline void close_frame_var_refs(JSRuntime *rt, JSFunctionBytecode *b,
+                                           JSStackFrame *sf, JSValue *local_buf,
+                                           JSValue *sp)
+{
+    JSVarRef *cells[FRAME_CYCLE_MAX];
+    JSValue *pval;
+    int i, n;
+
+    n = 0;
+    for(i = 0; i < b->var_ref_count; i++) {
+        JSVarRef *var_ref = sf->var_refs[i];
+        if (var_ref) {
+            close_var_ref(rt, sf, var_ref);
+            if (n < FRAME_CYCLE_MAX &&
+                JS_VALUE_GET_TAG(var_ref->value) == JS_TAG_OBJECT) {
+                js_rc(var_ref)->ref_count++;
+                cells[n++] = var_ref;
+            }
+        }
+    }
+    for(pval = local_buf; pval < sp; pval++)
+        JS_FreeValueRT(rt, *pval);
+    if (n != 0)
+        free_frame_cycles(rt, cells, n);
+}
+
 static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
                               JSStackFrame *sf, int var_idx)
 {
@@ -21302,12 +21444,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     } else {
     done:
         if (unlikely(b->var_ref_count != 0)) {
-            /* variable references reference the stack: must close them */
-            close_var_refs(rt, b, sf);
-        }
-        /* free the local variables and stack */
-        for(pval = local_buf; pval < sp; pval++) {
-            JS_FreeValue(ctx, *pval);
+            /* variable references reference the stack: must close
+               them. Also frees the local variables and stack. */
+            close_frame_var_refs(rt, b, sf, local_buf, sp);
+        } else {
+            /* free the local variables and stack */
+            for(pval = local_buf; pval < sp; pval++) {
+                JS_FreeValue(ctx, *pval);
+            }
         }
     }
     rt->current_stack_frame = sf->prev_frame;

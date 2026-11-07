@@ -3320,6 +3320,108 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
     }
 }
 
+/* Return the first position >= cptr where the single character test
+   'op' can match, or NULL. Characters >= 256 in a range test are
+   always candidates. */
+static const uint8_t *lre_find_candidate(REExecContext *s, const uint8_t *op,
+                                         const uint32_t *bitmap,
+                                         const uint8_t *cptr)
+{
+    const uint8_t *cbuf_end = s->cbuf_end;
+    if (*op == REOP_char) {
+        uint32_t c = get_u16(op + 1);
+        if (s->cbuf_type == 0) {
+            if (c >= 256)
+                return NULL;
+            return memchr(cptr, c, cbuf_end - cptr);
+        } else {
+            const uint16_t *p = (const uint16_t *)cptr;
+            const uint16_t *end = (const uint16_t *)cbuf_end;
+            for(; p < end; p++) {
+                if (*p == c)
+                    return (const uint8_t *)p;
+            }
+            return NULL;
+        }
+    } else {
+        if (s->cbuf_type == 0) {
+            for(; cptr < cbuf_end; cptr++) {
+                uint32_t c = *cptr;
+                if (bitmap[c >> 5] & (1U << (c & 31)))
+                    return cptr;
+            }
+            return NULL;
+        } else {
+            const uint16_t *p = (const uint16_t *)cptr;
+            const uint16_t *end = (const uint16_t *)cbuf_end;
+            for(; p < end; p++) {
+                uint32_t c = *p;
+                if (c >= 256 || (bitmap[c >> 5] & (1U << (c & 31))))
+                    return (const uint8_t *)p;
+            }
+            return NULL;
+        }
+    }
+}
+
+/* Run the regexp from cptr. When it is not sticky and its first
+   consuming opcode is a plain char or range test, only try the
+   positions where that test can match instead of every position. */
+static intptr_t lre_exec_scan(REExecContext *s, uint8_t **capture,
+                              const uint8_t *bc_buf, int re_flags,
+                              const uint8_t *cptr)
+{
+    const uint8_t *pc, *start_pc, *op, *p;
+    uint32_t bitmap[8];
+    intptr_t ret;
+    int i;
+
+    pc = bc_buf + RE_HEADER_LEN;
+    if (re_flags & LRE_FLAG_STICKY)
+        return lre_exec_backtrack(s, capture, pc, cptr);
+    /* skip the 'split_goto_first any goto' prefix */
+    start_pc = pc + 5 + 1 + 5;
+    op = start_pc;
+    while (*op == REOP_save_start)
+        op += 2;
+    if (*op == REOP_char) {
+        /* astral characters use char32 */
+    } else if (*op == REOP_range) {
+        int n = get_u16(op + 1);
+        memset(bitmap, 0, sizeof(bitmap));
+        for(i = 0; i < n; i++) {
+            uint32_t low = get_u16(op + 3 + i * 4);
+            uint32_t high = get_u16(op + 3 + i * 4 + 2);
+            if (low > 255)
+                break;
+            if (high > 255)
+                high = 255;
+            for(; low <= high; low++)
+                bitmap[low >> 5] |= 1U << (low & 31);
+        }
+    } else {
+        return lre_exec_backtrack(s, capture, pc, cptr);
+    }
+    for(;;) {
+        p = lre_find_candidate(s, op, bitmap, cptr);
+        if (!p)
+            return 0;
+        /* never start inside a surrogate pair in unicode mode */
+        if (s->cbuf_type == 2 && p > s->cbuf &&
+            is_lo_surrogate(*(const uint16_t *)p) &&
+            is_hi_surrogate(((const uint16_t *)p)[-1])) {
+            cptr = p + 2;
+            continue;
+        }
+        ret = lre_exec_backtrack(s, capture, start_pc, p);
+        if (ret != 0)
+            return ret;
+        for(i = 0; i < s->capture_count * 2; i++)
+            capture[i] = NULL;
+        cptr = p + (1 << (s->cbuf_type == 0 ? 0 : 1));
+    }
+}
+
 /* Return 1 if match, 0 if not match or < 0 if error (see LRE_RET_x). cindex is the
    starting position of the match and must be such as 0 <= cindex <=
    clen. */
@@ -3356,7 +3458,7 @@ int lre_exec(uint8_t **capture,
         }
     }
 
-    ret = lre_exec_backtrack(s, capture, bc_buf + RE_HEADER_LEN, cptr);
+    ret = lre_exec_scan(s, capture, bc_buf, re_flags, cptr);
 
     if (s->stack_buf != s->static_stack_buf)
         lre_realloc(s->opaque, s->stack_buf, 0);
